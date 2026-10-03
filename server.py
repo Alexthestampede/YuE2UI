@@ -75,7 +75,14 @@ def _worker():
         _set(job_id, status="running", stage="loading model", started=time.time())
         try:
             if pipe is None:
-                pipe = YuE2Pipeline.from_pretrained(MODEL, vae=VAE, device="cuda")
+                # torch-eager is ~2.1x faster than CUDA-graph execution on
+                # ROCm (measured RX 7800 XT: semantic 7.0 -> 22.3 tok/s);
+                # NVIDIA keeps the graph path. Override via YUE2UI_BACKEND.
+                import torch as _torch
+                backend = os.environ.get("YUE2UI_BACKEND") or (
+                    "torch-eager" if _torch.version.hip else "torch")
+                pipe = YuE2Pipeline.from_pretrained(MODEL, vae=VAE, device="cuda",
+                                                    backend=backend)
             if req.preview:
                 from dataclasses import replace as _dc_replace
                 from yue2.protocol import GenerationConfig
@@ -110,6 +117,8 @@ def _worker():
             _set(job_id, stage="reusing saved plan" if plan_dir else "planning score")
             if not plan_dir:
                 plan = pipe.plan(request=request, on_token=on_token)
+            else:
+                _set(job_id, tokens=0)
             _set(job_id, stage="generating song", abc=plan.abc)
             semantic = pipe.generate_semantic(plan, on_token=on_token)
             _set(job_id, stage="synthesizing audio")
