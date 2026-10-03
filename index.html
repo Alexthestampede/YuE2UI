@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YuE2 · song generator</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --text:#e8eaf0; --dim:#9aa3b2; --accent:#7c9cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,sans-serif; }
+  main { max-width:880px; margin:0 auto; padding:24px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin-bottom:20px; font-size:13px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:10px 0 4px; text-transform:uppercase; letter-spacing:.05em; }
+  textarea, input[type=text], input[type=number], select { width:100%; background:#0c0e12; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px 10px; font:inherit; }
+  textarea { min-height:120px; resize:vertical; }
+  textarea#abc { min-height:90px; font-family:ui-monospace,monospace; font-size:13px; }
+  .row { display:flex; gap:12px; }
+  .row > div { flex:1; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 22px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .bar { height:8px; background:#0c0e12; border-radius:4px; overflow:hidden; margin:10px 0 6px; }
+  .bar > div { height:100%; width:0%; background:var(--accent); transition:width .5s; }
+  .status { color:var(--dim); font-size:13px; }
+  .err { color:#ff7b72; white-space:pre-wrap; font-size:13px; }
+  audio { width:100%; margin-top:10px; }
+  pre.abc { font-size:12px; overflow-x:auto; color:var(--dim); max-height:220px; }
+  .songs { list-style:none; padding:0; margin:0; }
+  .songs li { display:flex; gap:12px; align-items:center; padding:8px 0; border-top:1px solid var(--line); font-size:13px; }
+  .songs li:first-child { border-top:0; }
+  .songs .meta { color:var(--dim); }
+  .songs audio { width:260px; margin:0; }
+  a { color:var(--accent); text-decoration:none; }
+  details summary { cursor:pointer; color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>YuE2 song generator</h1>
+  <div class="sub">m-a-p/YuE2-3B · RX 7800 XT · one song at a time</div>
+
+  <div class="panel">
+    <label>Style prompt</label>
+    <textarea id="style">English, warm synthwave, airy female vocals, analog pads, driving bass, gated drums, nostalgic chorus</textarea>
+
+    <label>Lyrics (use [Verse] / [Chorus] tags)</label>
+    <textarea id="lyrics">[Verse]
+City lights are burning slow
+Every window steals the glow
+We were running out of time
+Chasing every fading line
+
+[Chorus]
+Hold the night, don't let it go
+Electric hearts in afterglow
+One more drive before the dawn
+Sing it loud and carry on</textarea>
+
+    <label>Mode</label>
+    <div class="row">
+      <div>
+        <select id="cot">
+          <option value="full">full — plan melody + chords (editable)</option>
+          <option value="melody">melody — plan melody only (covers)</option>
+          <option value="off">off — direct generation</option>
+        </select>
+      </div>
+      <div style="max-width:180px">
+        <label>Seed (blank = random)</label>
+        <input type="text" id="seed" placeholder="random">
+      </div>
+    </div>
+
+    <label>Quality</label>
+    <select id="quality">
+      <option value="preview" selected>preview — 16 NAR steps (recommended; same take as full)</option>
+      <option value="">full — 32 NAR steps (marginal audible gain, 2× NAR time)</option>
+    </select>
+
+    <label>ABC score (optional — reuse or edit an existing plan)</label>
+    <textarea id="abc" placeholder="paste score.abc here to force the melody/chords"></textarea>
+
+    <div style="margin-top:14px">
+      <button id="go">Generate song</button>
+      <label style="display:inline;margin-left:14px;text-transform:none;letter-spacing:0;color:var(--text);font-size:13px">
+        <input type="checkbox" id="usePlan" style="width:auto"> Upgrade last preview to full quality (same plan + seed)
+      </label>
+    </div>
+  </div>
+
+  <div class="panel" id="jobPanel" style="display:none">
+    <div class="status" id="stage">queued</div>
+    <div class="bar"><div id="barFill"></div></div>
+    <div class="status" id="progressInfo"></div>
+    <div class="err" id="err"></div>
+    <div id="done">
+      <audio id="player" controls></audio>
+      <details style="margin-top:10px">
+        <summary>Generated ABC score</summary>
+        <pre class="abc" id="abcOut"></pre>
+      </details>
+      <div class="status" id="timing"></div>
+    <div style="margin-top:10px">
+      <button id="reroll">Re-render this take at full quality (upgrades a preview)</button>
+    </div>
+    <div class="status" style="margin-top:6px">Same plan + same seed = the same take, rendered at full quality. For a new take on the same melody, copy the ABC into the score box above and leave seed blank instead.</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <b style="font-size:14px">Previous songs</b>
+    <ul class="songs" id="songs"></ul>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let jobId = null, poll = null, lastPlanDir = null;
+
+const STAGES = {
+  "loading model": [2, "loading YuE2 (first run only)"],
+  "planning score": [12, "writing the score (AR)"],
+  "generating song": [58, "generating semantic tokens (AR)"],
+  "synthesizing audio": [88, "NAR synthesis"],
+  "decoding audio": [97, "VAE decode"],
+  "done": [100, ""]
+};
+
+function setProgress(stage, tokens) {
+  const [pct, label] = STAGES[stage] || [0, stage];
+  $("barFill").style.width = pct + "%";
+  $("stage").textContent = stage + (tokens ? ` · ${tokens} tokens` : "");
+  $("progressInfo").textContent = label;
+}
+
+async function loadSongs() {
+  const r = await fetch("/api/songs");
+  const list = await r.json();
+  $("songs").innerHTML = list.map(s =>
+    `<li><audio controls preload="none" src="${s.audio}"></audio>
+     <div><a href="/api/jobs/${s.id}/abc">${s.style || "(no style)"}</a>
+     <div class="meta">${s.seconds ? Math.round(s.seconds) + "s" : ""}${s.e2e ? " · " + Math.round(s.e2e) + "s e2e" : ""}</div></div></li>`).join("");
+}
+
+$("go").onclick = async () => {
+  const body = {
+    style: $("style").value,
+    lyrics: $("lyrics").value,
+    cot: $("cot").value,
+    abc: $("abc").value.trim() || null,
+    seed: $("seed").value ? parseInt($("seed").value, 10) : null,
+    plan_dir: $("usePlan").checked && lastPlanDir ? lastPlanDir : null,
+    preview: $("quality").value === "preview"
+  };
+  const r = await fetch("/api/generate", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  if (!r.ok) { $("err").textContent = "request failed: " + r.status; return; }
+  jobId = (await r.json()).id;
+  $("jobPanel").style.display = "";
+  $("done").style.display = "none";
+  $("err").textContent = "";
+  $("player").removeAttribute("src");
+  $("go").disabled = true;
+  poll = setInterval(check, 1000);
+  check();
+};
+
+async function check() {
+  if (!jobId) return;
+  const r = await fetch("/api/jobs/" + jobId);
+  const j = await r.json();
+  setProgress(j.stage, j.tokens);
+  if (j.status === "error") {
+    clearInterval(poll); $("go").disabled = false;
+    $("err").textContent = j.error + "\n\nsee /api/jobs/" + jobId + "/trace";
+  } else if (j.status === "done") {
+    clearInterval(poll); $("go").disabled = false;
+    $("done").style.display = "";
+    $("player").src = j.result.audio;
+    lastPlanDir = j.result.dir;
+    $("usePlan").disabled = false;
+    const t = j.result.timing || {};
+    $("timing").textContent =
+      `finished: ${Math.round(j.result.seconds)}s song · ` +
+      `plan ${Math.round(t.abc?.seconds ?? 0)}s · semantic ${Math.round(t.semantic?.seconds ?? 0)}s · ` +
+      `NAR ${Math.round(t.nar_seconds ?? 0)}s · VAE ${Math.round(t.vae_seconds ?? 0)}s`;
+    try {
+      const abc = await (await fetch(j.result.abc)).text();
+      $("abcOut").textContent = abc;
+    } catch {}
+$("reroll").onclick = () => {
+  $("usePlan").checked = true;
+  $("quality").value = "";
+  $("go").click();
+};
+
+loadSongs();
+  }
+}
+
+loadSongs();
+</script>
+</body>
+</html>
